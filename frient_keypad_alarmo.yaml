@@ -1,0 +1,743 @@
+blueprint:
+  name: Frient KEPZB-110 keypad with Alarmo (Zigbee2MQTT)
+  description: >
+    Turns the Frient / Develco KEPZB-110 keypad into a terminal for Alarmo over
+    Zigbee2MQTT. Alarmo stays the single source of truth for alarm state; the
+    keypad only sends requests and displays what it is told.
+
+    Fork of Bygood91/frient_keypad_alarmo, with ideas borrowed from michaeln64
+    and teodesign. See the repository README for the full credit chain.
+
+    Fixed compared to the upstream blueprint:
+      - Added the missing `armed_home` state trigger. Arming in Home mode never
+        reached the keypad, which kept showing its previous state.
+      - PIN list is now trimmed. `1234; 5678` used to produce " 5678", and that
+        code never matched.
+      - Special codes are compared by strict equality instead of substring
+        matching. Typing `99` used to fire the action bound to `9911`.
+      - Invalid-code feedback now covers unknown RFID tags, which the numeric
+        test used to skip silently.
+      - IAS ACE transactions are acknowledged on valid commands, not only on
+        rejected ones. The keypad no longer waits for a reply that never comes.
+
+    Added:
+      - Duress code: disarms the panel for real, returns keypad feedback that is
+        identical to a normal disarm, then runs a silent action of your choice.
+      - Delegation mode: forward the entered code straight to Alarmo so it stays
+        the only code authority (per-user PINs, changed_by, lockout).
+      - Restart resync: pushes the current panel state back to the keypad after
+        a Home Assistant restart instead of leaving a stale display.
+      - Reinforced error feedback: three orange flashes, optional buzzer.
+
+    CODE PRIORITY (first match wins):
+      SOS > duress > special codes 1/2/3 > normal codes > invalid code
+    Special codes and the duress code must NOT appear in the normal code list.
+
+  domain: automation
+  source_url: https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/frient_keypad_alarmo.yaml
+  homeassistant:
+    min_version: 2024.10.0
+
+  input:
+
+    # ------------------------------------------------------------------ #
+    keypad:
+      name: Keypad
+      description: Zigbee2MQTT topics and accepted codes.
+      icon: mdi:dialpad
+      collapsed: false
+      input:
+        z2m_keypad_path:
+          name: Keypad MQTT state topic
+          description: >
+            Zigbee2MQTT base_topic plus the keypad friendly_name.
+            Example: zigbee2mqtt/Entrance_Keypad
+          selector:
+            text:
+        z2m_keypad_path_set:
+          name: Keypad MQTT set topic
+          description: >
+            The same topic with /set appended.
+            Example: zigbee2mqtt/Entrance_Keypad/set
+          selector:
+            text:
+        pin_list:
+          name: Accepted PIN codes and RFID tags
+          description: >
+            Semicolon-separated list. Spaces around the semicolons are
+            tolerated. RFID tags are declared with a leading +.
+            Example: 1234; 5678; +ACF5678B
+
+            Ignored when delegation to Alarmo is enabled below.
+          default: ""
+          selector:
+            text:
+
+    # ------------------------------------------------------------------ #
+    panel:
+      name: Alarm panel
+      icon: mdi:shield-lock
+      collapsed: false
+      input:
+        control_panel:
+          name: Panel entity
+          description: "Example: alarm_control_panel.alarmo"
+          selector:
+            entity:
+              filter:
+                - domain: alarm_control_panel
+              multiple: false
+        pin_control_panel:
+          name: Code sent to the panel
+          description: >
+            A code Alarmo accepts, used to drive the panel.
+
+            Required even in delegation mode: this is the code the duress
+            branch uses to disarm.
+          selector:
+            text:
+        delegate_codes:
+          name: Delegate code validation to Alarmo
+          description: >
+            OFF (default): the blueprint checks the entered code against the
+            list above, then sends a single shared code to the panel. Instant
+            orange feedback on a bad code, but Alarmo never sees a failure — no
+            lockout, no idea who disarmed.
+
+            ON: the entered code goes to Alarmo untouched and Alarmo validates
+            it. You get per-user codes, the changed_by attribute and Alarmo's
+            lockout after N failed attempts. Orange feedback is preserved but
+            inferred from the state the panel actually reaches after a short
+            grace period — see Advanced.
+          default: false
+          selector:
+            boolean:
+
+    # ------------------------------------------------------------------ #
+    duress:
+      name: Duress code
+      description: >
+        Disarming under threat. The panel really disarms and the keypad behaves
+        exactly as usual: nothing visible or audible may betray the alert.
+      icon: mdi:account-alert
+      collapsed: false
+      input:
+        duress_code:
+          name: Duress code
+          description: >
+            Leave empty to disable. This code must NOT appear in the normal
+            code list.
+          default: ""
+          selector:
+            text:
+        duress_action:
+          name: Silent action
+          description: >
+            Notifications, camera snapshots, and so on. No sound, no light, no
+            TTS here — any of those would give the alert away.
+          default: []
+          selector:
+            action: {}
+
+    # ------------------------------------------------------------------ #
+    state_actions:
+      name: Actions on state changes
+      description: >
+        Optional hooks. If your notifications are already configured in
+        Alarmo's own Notifications tab, leave these empty to avoid duplicates.
+      icon: mdi:shield-alert
+      collapsed: true
+      input:
+        action_arming:
+          name: Action - exit delay
+          default: []
+          selector:
+            action: {}
+        action_armed_away:
+          name: Action - armed away
+          default: []
+          selector:
+            action: {}
+        action_armed_home:
+          name: Action - armed home
+          default: []
+          selector:
+            action: {}
+        action_armed_night:
+          name: Action - armed night
+          default: []
+          selector:
+            action: {}
+        action_pending:
+          name: Action - entry delay
+          default: []
+          selector:
+            action: {}
+        action_disarmed:
+          name: Action - disarmed
+          default: []
+          selector:
+            action: {}
+        action_alarm:
+          name: Action - alarm triggered
+          default: []
+          selector:
+            action: {}
+        action_panic:
+          name: Action - SOS button
+          description: Long press on the keypad's SOS key.
+          default: []
+          selector:
+            action: {}
+
+    # ------------------------------------------------------------------ #
+    special_codes:
+      name: Special codes
+      description: >
+        Codes that run an arbitrary action. They must not appear in the normal
+        code list: they are evaluated before it and would prevent arming or
+        disarming.
+      icon: mdi:gesture-tap-button
+      collapsed: true
+      input:
+        custom_pincode_1:
+          name: Special code 1
+          default: ""
+          selector:
+            text:
+        custom_action_1:
+          name: Action for special code 1
+          default: []
+          selector:
+            action: {}
+        custom_pincode_2:
+          name: Special code 2
+          default: ""
+          selector:
+            text:
+        custom_action_2:
+          name: Action for special code 2
+          default: []
+          selector:
+            action: {}
+        custom_pincode_3:
+          name: Special code 3
+          default: ""
+          selector:
+            text:
+        custom_action_3:
+          name: Action for special code 3
+          default: []
+          selector:
+            action: {}
+
+    # ------------------------------------------------------------------ #
+    advanced:
+      name: Advanced
+      icon: mdi:cog
+      collapsed: true
+      input:
+        invalid_beep:
+          name: Keypad buzzer on invalid code
+          description: >
+            Adds a short beep to each of the three orange flashes.
+
+            Only enable this if the Exposes tab of your keypad in Zigbee2MQTT
+            actually shows a `warning` property. Some converter versions expose
+            `arm_mode` only, and the command will just fill your Z2M log with
+            errors and do nothing.
+          default: false
+          selector:
+            boolean:
+        delegate_grace:
+          name: Grace period in delegation mode
+          description: >
+            Time given to Alarmo to react before judging whether the command
+            succeeded. Too short and valid codes will flash orange; too long
+            and the error feedback drags. 2 seconds suits a healthy setup;
+            raise it to 3 or 4 on a loaded host.
+          default: 2
+          selector:
+            number:
+              min: 1
+              max: 10
+              unit_of_measurement: s
+              mode: box
+        resync_delay:
+          name: Restart resync delay
+          description: >
+            Time given to Zigbee2MQTT and the MQTT broker to come up before
+            pushing the panel state back to the keypad after a Home Assistant
+            restart.
+          default: 45
+          selector:
+            number:
+              min: 5
+              max: 300
+              unit_of_measurement: s
+              mode: box
+
+mode: parallel
+max: 10
+
+# ====================================================================== #
+variables:
+  panel_entity: !input control_panel
+  panel_code: !input pin_control_panel
+  delegate: !input delegate_codes
+  invalid_beep: !input invalid_beep
+  grace: !input delegate_grace
+
+  pin_list_var: !input pin_list
+  # Split, then strip stray spaces around the semicolons
+  pin_list: >-
+    {{ pin_list_var | string | split(';') | map('trim') | reject('eq', '') | list }}
+
+  duress_code: !input duress_code
+  custom_pincode_1: !input custom_pincode_1
+  custom_pincode_2: !input custom_pincode_2
+  custom_pincode_3: !input custom_pincode_3
+
+  # Every special-purpose code, excluded from the invalid-code feedback
+  special_codes: >-
+    {{ [duress_code, custom_pincode_1, custom_pincode_2, custom_pincode_3]
+       | map('string') | map('trim') | reject('eq', '') | list }}
+
+  # Home Assistant state -> IAS ACE panel status
+  state_to_keypad:
+    disarmed: disarm
+    armed_away: arm_all_zones
+    armed_home: arm_day_zones
+    armed_night: arm_night_zones
+    triggered: in_alarm
+
+  # Keypad command -> service to call
+  services:
+    arm_all_zones: alarm_control_panel.alarm_arm_away
+    arm_day_zones: alarm_control_panel.alarm_arm_home
+    arm_night_zones: alarm_control_panel.alarm_arm_night
+    disarm: alarm_control_panel.alarm_disarm
+
+  # Defensive extraction: these are also evaluated on state triggers, where
+  # payload_json does not exist.
+  keypad_action: >-
+    {{ trigger.payload_json.action | default('', true) | string
+       if trigger.payload_json is defined else '' }}
+  entered_code: >-
+    {{ trigger.payload_json.action_code | default('', true) | string | trim
+       if trigger.payload_json is defined else '' }}
+
+  # An IAS ACE acknowledgement only makes sense when the keypad supplied a
+  # transaction sequence number to echo back.
+  transaction_ok: >-
+    {{ trigger.payload_json is defined
+       and trigger.payload_json.action_transaction is defined
+       and trigger.payload_json.action_transaction is not none }}
+
+# ====================================================================== #
+triggers:
+  - trigger: state
+    entity_id: !input control_panel
+    to: arming
+    id: panel_arming
+  - trigger: state
+    entity_id: !input control_panel
+    to: armed_away
+    id: panel_armed_away
+  - trigger: state
+    entity_id: !input control_panel
+    to: armed_home
+    id: panel_armed_home        # <-- missing upstream: Home mode never
+                                #     reached the keypad
+  - trigger: state
+    entity_id: !input control_panel
+    to: armed_night
+    id: panel_armed_night
+  - trigger: state
+    entity_id: !input control_panel
+    to: pending
+    id: panel_pending
+  - trigger: state
+    entity_id: !input control_panel
+    to: triggered
+    id: panel_triggered
+  - trigger: state
+    entity_id: !input control_panel
+    to: disarmed
+    id: panel_disarmed
+  - trigger: mqtt
+    topic: !input z2m_keypad_path
+    id: keypad_mqtt
+  - trigger: homeassistant
+    event: start
+    id: ha_start
+
+conditions: []
+
+# ====================================================================== #
+actions:
+  - choose:
+
+      # ================================================================ #
+      # 1. Panel state -> keypad
+      #    (Panel Status Changed: asynchronous, no transaction)
+      # ================================================================ #
+      - alias: Exit delay
+        conditions:
+          - condition: trigger
+            id: panel_arming
+        sequence:
+          - action: mqtt.publish
+            data:
+              topic: !input z2m_keypad_path_set
+              payload: '{"arm_mode": {"mode": "exit_delay"}}'
+          - choose: []
+            default: !input action_arming
+
+      - alias: Armed away
+        conditions:
+          - condition: trigger
+            id: panel_armed_away
+        sequence:
+          - action: mqtt.publish
+            data:
+              topic: !input z2m_keypad_path_set
+              payload: '{"arm_mode": {"mode": "arm_all_zones"}}'
+          - choose: []
+            default: !input action_armed_away
+
+      - alias: Armed home
+        conditions:
+          - condition: trigger
+            id: panel_armed_home
+        sequence:
+          - action: mqtt.publish
+            data:
+              topic: !input z2m_keypad_path_set
+              payload: '{"arm_mode": {"mode": "arm_day_zones"}}'
+          - choose: []
+            default: !input action_armed_home
+
+      - alias: Armed night
+        conditions:
+          - condition: trigger
+            id: panel_armed_night
+        sequence:
+          - action: mqtt.publish
+            data:
+              topic: !input z2m_keypad_path_set
+              payload: '{"arm_mode": {"mode": "arm_night_zones"}}'
+          - choose: []
+            default: !input action_armed_night
+
+      - alias: Entry delay
+        conditions:
+          - condition: trigger
+            id: panel_pending
+        sequence:
+          - action: mqtt.publish
+            data:
+              topic: !input z2m_keypad_path_set
+              payload: '{"arm_mode": {"mode": "entry_delay"}}'
+          - choose: []
+            default: !input action_pending
+
+      - alias: Alarm triggered
+        conditions:
+          - condition: trigger
+            id: panel_triggered
+        sequence:
+          - action: mqtt.publish
+            data:
+              topic: !input z2m_keypad_path_set
+              payload: '{"arm_mode": {"mode": "in_alarm"}}'
+          - choose: []
+            default: !input action_alarm
+
+      - alias: Disarmed
+        conditions:
+          - condition: trigger
+            id: panel_disarmed
+        sequence:
+          - action: mqtt.publish
+            data:
+              topic: !input z2m_keypad_path_set
+              payload: '{"arm_mode": {"mode": "disarm"}}'
+          - choose: []
+            default: !input action_disarmed
+
+      # ================================================================ #
+      # 2. Resync the keypad after a Home Assistant restart
+      # ================================================================ #
+      - alias: Restart resync
+        conditions:
+          - condition: trigger
+            id: ha_start
+        sequence:
+          - delay:
+              seconds: !input resync_delay
+          - action: mqtt.publish
+            data:
+              topic: !input z2m_keypad_path_set
+              payload: >-
+                {"arm_mode": {"mode": "{{ state_to_keypad.get(states(panel_entity), 'disarm') }}"}}
+
+      # ================================================================ #
+      # 3. SOS button (no code, no transaction to acknowledge)
+      # ================================================================ #
+      - alias: SOS button
+        conditions:
+          - condition: trigger
+            id: keypad_mqtt
+          - condition: template
+            value_template: "{{ keypad_action == 'emergency' }}"
+        sequence:
+          - choose: []
+            default: !input action_panic
+
+      # ================================================================ #
+      # 4. Duress code
+      #    Evaluated before everything else. The disarm is real, and the
+      #    acknowledgement reports "disarm" exactly as it would for a normal
+      #    code: nothing at the keypad tells the two apart.
+      # ================================================================ #
+      - alias: Duress code
+        conditions:
+          - condition: trigger
+            id: keypad_mqtt
+          - condition: template
+            value_template: >-
+              {{ duress_code | string | trim != ''
+                 and entered_code == duress_code | string | trim
+                 and keypad_action in ['disarm', 'arm_all_zones',
+                                       'arm_day_zones', 'arm_night_zones'] }}
+        sequence:
+          # Arm Response: closes the transaction the keypad opened
+          - if:
+              - condition: template
+                value_template: "{{ transaction_ok }}"
+            then:
+              - action: mqtt.publish
+                data:
+                  topic: !input z2m_keypad_path_set
+                  payload: >-
+                    {"arm_mode": {"transaction": {{ trigger.payload_json.action_transaction }},
+                     "mode": "disarm"}}
+          - action: alarm_control_panel.alarm_disarm
+            target:
+              entity_id: !input control_panel
+            data:
+              code: "{{ panel_code }}"
+          # Silent alert. continue_on_error keeps one unavailable notification
+          # service from breaking the chain.
+          - choose: []
+            default: !input duress_action
+            continue_on_error: true
+
+      # ================================================================ #
+      # 5. Special codes (strict equality, no substring match)
+      #    The acknowledgement reports the panel's REAL state: we do not tell
+      #    the keypad about an arming that never happened.
+      # ================================================================ #
+      - alias: Special code 1
+        conditions:
+          - condition: trigger
+            id: keypad_mqtt
+          - condition: template
+            value_template: >-
+              {{ custom_pincode_1 | string | trim != ''
+                 and entered_code == custom_pincode_1 | string | trim }}
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ transaction_ok }}"
+            then:
+              - action: mqtt.publish
+                data:
+                  topic: !input z2m_keypad_path_set
+                  payload: >-
+                    {"arm_mode": {"transaction": {{ trigger.payload_json.action_transaction }},
+                     "mode": "{{ state_to_keypad.get(states(panel_entity), 'disarm') }}"}}
+          - choose: []
+            default: !input custom_action_1
+
+      - alias: Special code 2
+        conditions:
+          - condition: trigger
+            id: keypad_mqtt
+          - condition: template
+            value_template: >-
+              {{ custom_pincode_2 | string | trim != ''
+                 and entered_code == custom_pincode_2 | string | trim }}
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ transaction_ok }}"
+            then:
+              - action: mqtt.publish
+                data:
+                  topic: !input z2m_keypad_path_set
+                  payload: >-
+                    {"arm_mode": {"transaction": {{ trigger.payload_json.action_transaction }},
+                     "mode": "{{ state_to_keypad.get(states(panel_entity), 'disarm') }}"}}
+          - choose: []
+            default: !input custom_action_2
+
+      - alias: Special code 3
+        conditions:
+          - condition: trigger
+            id: keypad_mqtt
+          - condition: template
+            value_template: >-
+              {{ custom_pincode_3 | string | trim != ''
+                 and entered_code == custom_pincode_3 | string | trim }}
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ transaction_ok }}"
+            then:
+              - action: mqtt.publish
+                data:
+                  topic: !input z2m_keypad_path_set
+                  payload: >-
+                    {"arm_mode": {"transaction": {{ trigger.payload_json.action_transaction }},
+                     "mode": "{{ state_to_keypad.get(states(panel_entity), 'disarm') }}"}}
+          - choose: []
+            default: !input custom_action_3
+
+      # ================================================================ #
+      # 6a. Normal command, code validated by the blueprint
+      #     The code is already checked, so the acknowledgement is immediate
+      #     and optimistic: the keypad never waits.
+      # ================================================================ #
+      - alias: Standard command (local validation)
+        conditions:
+          - condition: trigger
+            id: keypad_mqtt
+          - condition: template
+            value_template: >-
+              {{ not delegate
+                 and keypad_action in services
+                 and entered_code in pin_list }}
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ transaction_ok }}"
+            then:
+              - action: mqtt.publish
+                data:
+                  topic: !input z2m_keypad_path_set
+                  payload: >-
+                    {"arm_mode": {"transaction": {{ trigger.payload_json.action_transaction }},
+                     "mode": "{{ keypad_action }}"}}
+          - action: "{{ services[keypad_action] }}"
+            target:
+              entity_id: !input control_panel
+            data:
+              code: "{{ panel_code }}"
+
+      # ================================================================ #
+      # 6b. Normal command, validation delegated to Alarmo
+      #     We cannot judge the code, so we let Alarmo react and then
+      #     acknowledge according to the state actually reached. This is what
+      #     keeps the orange feedback alive in delegation mode.
+      # ================================================================ #
+      - alias: Standard command (validated by Alarmo)
+        conditions:
+          - condition: trigger
+            id: keypad_mqtt
+          - condition: template
+            value_template: "{{ delegate and keypad_action in services }}"
+        sequence:
+          # continue_on_error: depending on the Alarmo version a rejected code
+          # may raise, and the sequence must survive to show the error.
+          - action: "{{ services[keypad_action] }}"
+            target:
+              entity_id: !input control_panel
+            data:
+              code: "{{ entered_code }}"
+            continue_on_error: true
+          - delay:
+              seconds: "{{ grace }}"
+          - variables:
+              final_state: "{{ states(panel_entity) }}"
+              succeeded: >-
+                {{ (keypad_action == 'disarm' and final_state == 'disarmed')
+                   or (keypad_action != 'disarm' and final_state != 'disarmed') }}
+          - if:
+              - condition: template
+                value_template: "{{ succeeded }}"
+            then:
+              - if:
+                  - condition: template
+                    value_template: "{{ transaction_ok }}"
+                then:
+                  - action: mqtt.publish
+                    data:
+                      topic: !input z2m_keypad_path_set
+                      payload: >-
+                        {"arm_mode": {"transaction": {{ trigger.payload_json.action_transaction }},
+                         "mode": "{{ keypad_action }}"}}
+            else:
+              - repeat:
+                  count: 3
+                  sequence:
+                    - action: mqtt.publish
+                      data:
+                        topic: !input z2m_keypad_path_set
+                        payload: >-
+                          {"arm_mode": {"transaction": {{ trigger.payload_json.action_transaction | default(0) }},
+                           "mode": "invalid_code"}}
+                    - if:
+                        - condition: template
+                          value_template: "{{ invalid_beep }}"
+                      then:
+                        - action: mqtt.publish
+                          continue_on_error: true
+                          data:
+                            topic: !input z2m_keypad_path_set
+                            payload: >-
+                              {"warning": {"mode": "emergency", "level": "high",
+                               "strobe": false, "duration": 1}}
+                    - delay:
+                        milliseconds: 500
+
+      # ================================================================ #
+      # 7. Unknown code or tag -> three orange flashes
+      #    Disabled in delegation mode, where branch 6b arbitrates.
+      # ================================================================ #
+      - alias: Invalid code
+        conditions:
+          - condition: trigger
+            id: keypad_mqtt
+          - condition: template
+            value_template: >-
+              {{ not delegate
+                 and entered_code != ''
+                 and entered_code not in pin_list
+                 and entered_code not in special_codes }}
+        sequence:
+          - repeat:
+              count: 3
+              sequence:
+                - action: mqtt.publish
+                  data:
+                    topic: !input z2m_keypad_path_set
+                    payload: >-
+                      {"arm_mode": {"transaction": {{ trigger.payload_json.action_transaction | default(0) }},
+                       "mode": "invalid_code"}}
+                - if:
+                    - condition: template
+                      value_template: "{{ invalid_beep }}"
+                  then:
+                    - action: mqtt.publish
+                      continue_on_error: true
+                      data:
+                        topic: !input z2m_keypad_path_set
+                        payload: >-
+                          {"warning": {"mode": "emergency", "level": "high",
+                           "strobe": false, "duration": 1}}
+                - delay:
+                    milliseconds: 500
+
+    default: []
