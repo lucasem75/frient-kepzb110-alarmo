@@ -34,7 +34,7 @@ blueprint:
     Special codes and the duress code must NOT appear in the normal code list.
 
   domain: automation
-  source_url: https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/frient_keypad_alarmo.yaml
+  source_url: https://raw.githubusercontent.com/lucasem75/frient-kepzb110-alarmo/main/frient_keypad_alarmo.yaml
   homeassistant:
     min_version: 2024.10.0
 
@@ -291,7 +291,7 @@ variables:
   pin_list_var: !input pin_list
   # Split, then strip stray spaces around the semicolons
   pin_list: >-
-    {{ pin_list_var | string | split(';') | map('trim') | reject('eq', '') | list }}
+    {{ (pin_list_var | string).split(';') | map('trim') | reject('eq', '') | list }}
 
   duress_code: !input duress_code
   custom_pincode_1: !input custom_pincode_1
@@ -508,7 +508,7 @@ actions:
           - condition: template
             value_template: >-
               {{ duress_code | string | trim != ''
-                 and entered_code == duress_code | string | trim
+                 and entered_code | string | trim == duress_code | string | trim
                  and keypad_action in ['disarm', 'arm_all_zones',
                                        'arm_day_zones', 'arm_night_zones'] }}
         sequence:
@@ -546,7 +546,7 @@ actions:
           - condition: template
             value_template: >-
               {{ custom_pincode_1 | string | trim != ''
-                 and entered_code == custom_pincode_1 | string | trim }}
+                 and entered_code | string | trim == custom_pincode_1 | string | trim }}
         sequence:
           - if:
               - condition: template
@@ -568,7 +568,7 @@ actions:
           - condition: template
             value_template: >-
               {{ custom_pincode_2 | string | trim != ''
-                 and entered_code == custom_pincode_2 | string | trim }}
+                 and entered_code | string | trim == custom_pincode_2 | string | trim }}
         sequence:
           - if:
               - condition: template
@@ -590,7 +590,7 @@ actions:
           - condition: template
             value_template: >-
               {{ custom_pincode_3 | string | trim != ''
-                 and entered_code == custom_pincode_3 | string | trim }}
+                 and entered_code | string | trim == custom_pincode_3 | string | trim }}
         sequence:
           - if:
               - condition: template
@@ -618,7 +618,7 @@ actions:
             value_template: >-
               {{ not delegate
                  and keypad_action in services
-                 and entered_code in pin_list }}
+                 and entered_code | string | trim in pin_list }}
         sequence:
           - if:
               - condition: template
@@ -714,8 +714,8 @@ actions:
             value_template: >-
               {{ not delegate
                  and entered_code != ''
-                 and entered_code not in pin_list
-                 and entered_code not in special_codes }}
+                 and entered_code | string | trim not in pin_list
+                 and entered_code | string | trim not in special_codes }}
         sequence:
           - repeat:
               count: 3
