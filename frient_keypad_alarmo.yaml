@@ -28,13 +28,19 @@ blueprint:
       - Restart resync: pushes the current panel state back to the keypad after
         a Home Assistant restart instead of leaving a stale display.
       - Reinforced error feedback: three orange flashes, optional buzzer.
+      - "Not ready" feedback: when Alarmo refuses to arm, the keypad says so
+        at the door instead of staying silent, and the delegation branch no
+        longer mistakes a refused arming for a bad code.
+      - Codeless arming handled: pressing an arm button on its own sends an
+        empty code, which was forwarded as code: "" and rejected outright.
+        The parameter is now omitted so the panel can decide.
 
     CODE PRIORITY (first match wins):
       SOS > duress > special codes 1/2/3 > normal codes > invalid code
     Special codes and the duress code must NOT appear in the normal code list.
 
   domain: automation
-  source_url: https://raw.githubusercontent.com/lucasem75/frient-kepzb110-alarmo/main/frient_keypad_alarmo.yaml
+  source_url: https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/frient_keypad_alarmo.yaml
   homeassistant:
     min_version: 2024.10.0
 
@@ -189,6 +195,15 @@ blueprint:
           default: []
           selector:
             action: {}
+        action_arm_failed:
+          name: Action - arming refused
+          description: >-
+            Runs when Alarmo refuses to arm. The triggering event is available
+            as `trigger.event.data`, which carries `reason` and the list of
+            offending `sensors`.
+          default: []
+          selector:
+            action: {}
 
     # ------------------------------------------------------------------ #
     special_codes:
@@ -237,6 +252,43 @@ blueprint:
       icon: mdi:cog
       collapsed: true
       input:
+        allow_codeless_arming:
+          name: Allow arming without a code
+          description: >-
+            The keypad sends an empty `action_code` when an arm button is
+            pressed on its own. With this on, such a command is forwarded to
+            the panel with no code at all, so the panel decides whether it is
+            acceptable.
+
+            Only applies to arming, never to disarming. Ignored in delegation
+            mode, where the command is always forwarded and Alarmo arbitrates.
+          default: false
+          selector:
+            boolean:
+        not_ready_enabled:
+          name: Show "not ready" when Alarmo refuses to arm
+          description: >-
+            Listens for Alarmo's `alarmo_failed_to_arm` event and pushes the
+            IAS ACE `not_ready` status to the keypad, so a refused arming is
+            visible at the door instead of only in a notification.
+
+            Requires Alarmo. Turn it off if you drive another alarm panel.
+          default: true
+          selector:
+            boolean:
+        not_ready_hold:
+          name: How long to hold the "not ready" display
+          description: >-
+            After this delay the keypad is put back in step with the panel's
+            real state, since a refused arming produces no state change of its
+            own to restore it.
+          default: 5
+          selector:
+            number:
+              min: 1
+              max: 30
+              unit_of_measurement: s
+              mode: box
         invalid_beep:
           name: Keypad buzzer on invalid code
           description: >
@@ -286,6 +338,8 @@ variables:
   panel_code: !input pin_control_panel
   delegate: !input delegate_codes
   invalid_beep: !input invalid_beep
+  not_ready_enabled: !input not_ready_enabled
+  allow_codeless: !input allow_codeless_arming
   grace: !input delegate_grace
 
   pin_list_var: !input pin_list
@@ -371,6 +425,11 @@ triggers:
   - trigger: homeassistant
     event: start
     id: ha_start
+  # Alarmo refuses to arm (open sensor, not allowed...). Carries entity_id,
+  # reason and the offending sensors in its event data.
+  - trigger: event
+    event_type: alarmo_failed_to_arm
+    id: arm_failed
 
 conditions: []
 
@@ -483,7 +542,39 @@ actions:
                 {"arm_mode": {"mode": "{{ state_to_keypad.get(states(panel_entity), 'disarm') }}"}}
 
       # ================================================================ #
-      # 3. SOS button (no code, no transaction to acknowledge)
+      # 3. Alarmo refused to arm -> "not ready" on the keypad
+      #    A refused arming produces no state change, so nothing would
+      #    restore the display on its own: we put the keypad back in step
+      #    with the panel after a short hold.
+      # ================================================================ #
+      - alias: Arming refused
+        conditions:
+          - condition: trigger
+            id: arm_failed
+          - condition: template
+            value_template: "{{ not_ready_enabled }}"
+          # Only react to our own panel: the event is fired per Alarmo area.
+          - condition: template
+            value_template: >-
+              {{ trigger.event.data.entity_id | default('') == panel_entity }}
+        sequence:
+          - action: mqtt.publish
+            data:
+              topic: !input z2m_keypad_path_set
+              payload: '{"arm_mode": {"mode": "not_ready"}}'
+          - choose: []
+            default: !input action_arm_failed
+            continue_on_error: true
+          - delay:
+              seconds: !input not_ready_hold
+          - action: mqtt.publish
+            data:
+              topic: !input z2m_keypad_path_set
+              payload: >-
+                {"arm_mode": {"mode": "{{ state_to_keypad.get(states(panel_entity), 'disarm') }}"}}
+
+      # ================================================================ #
+      # 4. SOS button (no code, no transaction to acknowledge)
       # ================================================================ #
       - alias: SOS button
         conditions:
@@ -496,7 +587,7 @@ actions:
             default: !input action_panic
 
       # ================================================================ #
-      # 4. Duress code
+      # 5. Duress code
       #    Evaluated before everything else. The disarm is real, and the
       #    acknowledgement reports "disarm" exactly as it would for a normal
       #    code: nothing at the keypad tells the two apart.
@@ -535,7 +626,7 @@ actions:
             continue_on_error: true
 
       # ================================================================ #
-      # 5. Special codes (strict equality, no substring match)
+      # 6. Special codes (strict equality, no substring match)
       #    The acknowledgement reports the panel's REAL state: we do not tell
       #    the keypad about an arming that never happened.
       # ================================================================ #
@@ -606,7 +697,7 @@ actions:
             default: !input custom_action_3
 
       # ================================================================ #
-      # 6a. Normal command, code validated by the blueprint
+      # 7a. Normal command, code validated by the blueprint
       #     The code is already checked, so the acknowledgement is immediate
       #     and optimistic: the keypad never waits.
       # ================================================================ #
@@ -618,7 +709,10 @@ actions:
             value_template: >-
               {{ not delegate
                  and keypad_action in services
-                 and entered_code | string | trim in pin_list }}
+                 and (entered_code | string | trim in pin_list
+                      or (allow_codeless
+                          and entered_code | string | trim == ''
+                          and keypad_action != 'disarm')) }}
         sequence:
           - if:
               - condition: template
@@ -637,7 +731,7 @@ actions:
               code: "{{ panel_code }}"
 
       # ================================================================ #
-      # 6b. Normal command, validation delegated to Alarmo
+      # 7b. Normal command, validation delegated to Alarmo
       #     We cannot judge the code, so we let Alarmo react and then
       #     acknowledge according to the state actually reached. This is what
       #     keeps the orange feedback alive in delegation mode.
@@ -649,14 +743,28 @@ actions:
           - condition: template
             value_template: "{{ delegate and keypad_action in services }}"
         sequence:
+          # The keypad sends an empty action_code when an arm button is pressed
+          # on its own. Passing code: "" would be rejected outright, so the
+          # parameter is omitted entirely and Alarmo decides whether a codeless
+          # command is acceptable.
+          #
           # continue_on_error: depending on the Alarmo version a rejected code
           # may raise, and the sequence must survive to show the error.
-          - action: "{{ services[keypad_action] }}"
-            target:
-              entity_id: !input control_panel
-            data:
-              code: "{{ entered_code }}"
-            continue_on_error: true
+          - if:
+              - condition: template
+                value_template: "{{ entered_code | string | trim != '' }}"
+            then:
+              - action: "{{ services[keypad_action] }}"
+                target:
+                  entity_id: !input control_panel
+                data:
+                  code: "{{ entered_code }}"
+                continue_on_error: true
+            else:
+              - action: "{{ services[keypad_action] }}"
+                target:
+                  entity_id: !input control_panel
+                continue_on_error: true
           - delay:
               seconds: "{{ grace }}"
           - variables:
@@ -664,6 +772,13 @@ actions:
               succeeded: >-
                 {{ (keypad_action == 'disarm' and final_state == 'disarmed')
                    or (keypad_action != 'disarm' and final_state != 'disarmed') }}
+              # An arming refused for an open sensor is not a bad code. Branch 3
+              # already showed "not ready", so stay quiet rather than contradict
+              # it with an orange flash and a wrong diagnosis.
+              refused: >-
+                {{ not_ready_enabled
+                   and keypad_action != 'disarm'
+                   and (state_attr(panel_entity, 'open_sensors') or {}) | count > 0 }}
           - if:
               - condition: template
                 value_template: "{{ succeeded }}"
@@ -679,6 +794,8 @@ actions:
                         {"arm_mode": {"transaction": {{ trigger.payload_json.action_transaction }},
                          "mode": "{{ keypad_action }}"}}
             else:
+              - condition: template
+                value_template: "{{ not refused }}"
               - repeat:
                   count: 3
                   sequence:
@@ -703,8 +820,8 @@ actions:
                         milliseconds: 500
 
       # ================================================================ #
-      # 7. Unknown code or tag -> three orange flashes
-      #    Disabled in delegation mode, where branch 6b arbitrates.
+      # 8. Unknown code or tag -> three orange flashes
+      #    Disabled in delegation mode, where branch 7b arbitrates.
       # ================================================================ #
       - alias: Invalid code
         conditions:
